@@ -1,0 +1,3 @@
+# One computer name per line. Copy this file to machines.txt.
+VM-WIN11-01
+VM-WIN11-02
