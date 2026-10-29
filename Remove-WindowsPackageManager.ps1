@@ -1,247 +1,199 @@
 <#
 .SYNOPSIS
-    Remotely removes Windows Package Manager (winget / App Installer) from many machines.
+    Pulls logon/logoff activity for a single user from the Windows Security event log.
 
 .DESCRIPTION
-    For each target computer:
-      1. Removes the provisioned package so new user profiles don't get it.
-      2. Removes the installed AppX package(s) for ALL user profiles.
-      3. (Optional) Sets the policy that disables App Installer / winget.
+    Give it a username (it resolves the SID for you) or a SID directly.
+    Collects:
+        4624  Logon
+        4625  Failed logon
+        4634  Logoff
+        4647  User-initiated logoff
+        4800  Workstation locked
+        4801  Workstation unlocked
+        4778  RDP session reconnected
+        4779  RDP session disconnected
 
-    Remove-AppxPackage fails inside a WinRM session with 0x80073D19
-    ("a user was logged off"), so the removal itself runs locally on each
-    machine as SYSTEM via a temporary scheduled task. WinRM (Invoke-Command)
-    is only used to create the task, wait for it, and collect the result.
-    Machines are processed in parallel and a CSV report is written.
-
-.PARAMETER ComputerListPath
-    Text file with one computer name per line.
-    Defaults to machines.txt in the same folder as this script
-    (or the current folder if the script folder can't be determined).
-
-.PARAMETER ReportOnly
-    Only report what is installed; change nothing.
-
-.PARAMETER DisablePolicy
-    Also set HKLM\SOFTWARE\Policies\Microsoft\Windows\AppInstaller\EnableAppInstaller = 0.
-
-.PARAMETER TimeoutSeconds
-    How long to wait on each machine for the removal task to finish.
+    Must be run from an elevated (Run as Administrator) PowerShell session,
+    or with an account that can read the Security log on the target computer.
 
 .EXAMPLE
-    .\Remove-WindowsPackageManager.ps1 -ReportOnly
+    .\Get-UserLogonHistory.ps1 -UserName CONTOSO\jdoe
+
 .EXAMPLE
-    .\Remove-WindowsPackageManager.ps1 -DisablePolicy
+    .\Get-UserLogonHistory.ps1 -UserName jdoe -StartTime (Get-Date).AddDays(-30) -InteractiveOnly -ExportCsv C:\Temp\jdoe_logons.csv
+
+.EXAMPLE
+    .\Get-UserLogonHistory.ps1 -Sid S-1-5-21-1111111111-2222222222-3333333333-1105 -ComputerName PC042
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'ByName')]
 param(
-    [string]$ComputerListPath,
+    # Username: "DOMAIN\user", "COMPUTER\user", or just "user"
+    [Parameter(Mandatory, ParameterSetName = 'ByName', Position = 0)]
+    [string]$UserName,
 
-    [switch]$ReportOnly,
+    # Use this instead of -UserName if you already have the SID
+    [Parameter(Mandatory, ParameterSetName = 'BySid')]
+    [string]$Sid,
 
-    [switch]$DisablePolicy,
+    # Computer whose Security log to read (default: this one)
+    [string]$ComputerName = $env:COMPUTERNAME,
 
-    [pscredential]$Credential,
+    [datetime]$StartTime = (Get-Date).AddDays(-7),
+    [datetime]$EndTime   = (Get-Date),
 
-    [int]$ThrottleLimit = 20,
+    # Only show interactive/RDP/unlock/cached logons (hides network, service, batch noise)
+    [switch]$InteractiveOnly,
 
-    [int]$TimeoutSeconds = 600,
-
-    [string]$ReportPath = ".\WinGetRemoval_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    # Optional path to save results as CSV
+    [string]$ExportCsv
 )
 
-# Default to machines.txt next to the script; fall back to the current folder
-# when $PSScriptRoot is empty (e.g. pasted into the console or run from an unsaved ISE tab).
-if (-not $ComputerListPath) {
-    $baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-    $ComputerListPath = Join-Path $baseDir 'machines.txt'
-}
-
-if (-not (Test-Path $ComputerListPath)) { throw "Machine list not found: $ComputerListPath" }
-
-$computers = Get-Content -Path $ComputerListPath |
-    ForEach-Object { $_.Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith('#') } |
-    Sort-Object -Unique
-
-if (-not $computers) { throw "No computer names found in $ComputerListPath" }
-Write-Host "Targeting $($computers.Count) computer(s)..." -ForegroundColor Cyan
-
-# This script runs ON each target machine, as SYSTEM, from a scheduled task.
-$workerScript = @'
-param([switch]$ReportOnly, [switch]$DisablePolicy, [string]$ResultPath)
-
-$names   = @('Microsoft.DesktopAppInstaller', 'Microsoft.Winget.Source')
-$actions = New-Object System.Collections.Generic.List[string]
-$errors  = New-Object System.Collections.Generic.List[string]
-
-function Get-Installed {
-    @(foreach ($n in $names) { Get-AppxPackage -AllUsers -Name $n -ErrorAction SilentlyContinue }) |
-        Sort-Object PackageFullName -Unique
-}
-
-try {
-    $installed   = @(Get-Installed)
-    $provisioned = @(Get-AppxProvisionedPackage -Online | Where-Object { $names -contains $_.DisplayName })
-    $before      = ($installed | Select-Object -ExpandProperty PackageFullName) -join '; '
-    $provBefore  = ($provisioned | Select-Object -ExpandProperty PackageName) -join '; '
-
-    if (-not $ReportOnly) {
-        # Stop any running winget / App Installer processes that would block removal
-        Get-Process -Name 'winget', 'AppInstaller', 'WindowsPackageManagerServer' -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
-
-        # Deprovision first so the package isn't re-registered for users
-        foreach ($p in $provisioned) {
-            try {
-                Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction Stop | Out-Null
-                $actions.Add("Deprovisioned $($p.PackageName)")
-            } catch { $errors.Add("Deprovision $($p.PackageName): $($_.Exception.Message)") }
-        }
-
-        foreach ($pkg in $installed) {
-            try {
-                Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
-                $actions.Add("Removed $($pkg.PackageFullName) (all users)")
-            } catch {
-                # Fall back to removing it one user at a time
-                $allUsersError = $_.Exception.Message
-                $userFailures  = 0
-                foreach ($u in $pkg.PackageUserInformation) {
-                    $sid = $u.UserSecurityId.Sid
-                    try {
-                        Remove-AppxPackage -Package $pkg.PackageFullName -User $sid -ErrorAction Stop
-                        $actions.Add("Removed $($pkg.PackageFullName) for $sid")
-                    } catch {
-                        $userFailures++
-                        $errors.Add("Remove $($pkg.PackageFullName) for ${sid}: $($_.Exception.Message)")
-                    }
-                }
-                if ($userFailures -gt 0) {
-                    $errors.Add("Remove $($pkg.PackageFullName) -AllUsers: $allUsersError")
-                }
-            }
-        }
-
-        if ($DisablePolicy) {
-            try {
-                $key = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppInstaller'
-                if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-                New-ItemProperty -Path $key -Name 'EnableAppInstaller' -Value 0 -PropertyType DWord -Force | Out-Null
-                $actions.Add('Policy EnableAppInstaller=0 set')
-            } catch { $errors.Add("Policy: $($_.Exception.Message)") }
-        }
-    }
-
-    $remaining = @(Get-Installed)
-    $status = if ($errors.Count) { 'Error' }
-              elseif ($ReportOnly) { 'ReportOnly' }
-              elseif ($remaining.Count) { 'StillPresent' }
-              else { 'Removed' }
-} catch {
-    $status = 'Error'
-    $errors.Add("Unexpected: $($_.Exception.Message)")
-    $remaining = @()
-}
-
-$result = [pscustomobject]@{
-    Status            = $status
-    InstalledBefore   = $before
-    ProvisionedBefore = $provBefore
-    RemainingAfter    = ($remaining | Select-Object -ExpandProperty PackageFullName) -join '; '
-    Actions           = $actions -join ' | '
-    Errors            = $errors -join ' | '
-}
-
-# Write to a temp name, then rename, so the caller never reads a half-written file
-$result | ConvertTo-Json | Set-Content -Path "$ResultPath.tmp" -Encoding UTF8
-Move-Item -Path "$ResultPath.tmp" -Destination $ResultPath -Force
-'@
-
-# This runs over WinRM: it sets up the SYSTEM task, waits for it, and returns the result.
-$remoteBlock = {
-    param([string]$WorkerScript, [bool]$ReportOnly, [bool]$DisablePolicy, [int]$TimeoutSeconds)
-
-    $taskName   = 'Remove-WinGet-Temp'
-    $workDir    = Join-Path $env:SystemRoot 'Temp'
-    $workerPath = Join-Path $workDir 'Remove-WinGet-Worker.ps1'
-    $resultPath = Join-Path $workDir 'Remove-WinGet-Result.json'
-
+# ---------- Resolve username <-> SID ----------
+if ($PSCmdlet.ParameterSetName -eq 'ByName') {
     try {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-Item -Path $resultPath, "$resultPath.tmp" -Force -ErrorAction SilentlyContinue
-        Set-Content -Path $workerPath -Value $WorkerScript -Encoding UTF8
-
-        $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$workerPath`" -ResultPath `"$resultPath`""
-        if ($ReportOnly)    { $arguments += ' -ReportOnly' }
-        if ($DisablePolicy) { $arguments += ' -DisablePolicy' }
-
-        $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
-        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                        -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSeconds)
-
-        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskName
-
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-        while (-not (Test-Path $resultPath) -and (Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds 3
-        }
-
-        if (Test-Path $resultPath) {
-            Get-Content -Path $resultPath -Raw | ConvertFrom-Json
-        } else {
-            $lastResult = (Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue).LastTaskResult
-            [pscustomobject]@{
-                Status = 'Error'; InstalledBefore = ''; ProvisionedBefore = ''; RemainingAfter = ''; Actions = ''
-                Errors = "Timed out after $TimeoutSeconds s waiting for removal task (LastTaskResult: $lastResult)"
-            }
-        }
-    } catch {
-        [pscustomobject]@{
-            Status = 'Error'; InstalledBefore = ''; ProvisionedBefore = ''; RemainingAfter = ''; Actions = ''
-            Errors = "Task setup: $($_.Exception.Message)"
-        }
-    } finally {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-        Remove-Item -Path $workerPath, $resultPath, "$resultPath.tmp" -Force -ErrorAction SilentlyContinue
+        $Sid = (New-Object System.Security.Principal.NTAccount($UserName)).
+               Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }
+    catch {
+        throw "Could not resolve '$UserName' to a SID. Try DOMAIN\user format, or pass -Sid directly. " +
+              "(Local accounts on a remote computer can't be resolved from here; use -Sid.)"
     }
 }
-
-$icmParams = @{
-    ComputerName  = $computers
-    ScriptBlock   = $remoteBlock
-    ArgumentList  = $workerScript, [bool]$ReportOnly, [bool]$DisablePolicy, $TimeoutSeconds
-    ThrottleLimit = $ThrottleLimit
-    ErrorAction   = 'SilentlyContinue'
-    ErrorVariable = 'connErrors'
+else {
+    try {
+        $UserName = (New-Object System.Security.Principal.SecurityIdentifier($Sid)).
+                    Translate([System.Security.Principal.NTAccount]).Value
+    }
+    catch { $UserName = $null }
 }
-if ($Credential) { $icmParams.Credential = $Credential }
+$shortName = if ($UserName) { $UserName.Split('\')[-1] } else { $null }
 
-$results = @(Invoke-Command @icmParams | ForEach-Object {
+Write-Host "User: $(if ($UserName) { $UserName } else { '(unresolved)' })  SID: $Sid" -ForegroundColor Cyan
+Write-Host "Computer: $ComputerName   Range: $StartTime -> $EndTime" -ForegroundColor Cyan
+
+# ---------- Build the event log query ----------
+$fmt   = 'yyyy-MM-ddTHH:mm:ss.fffZ'
+$start = $StartTime.ToUniversalTime().ToString($fmt)
+$end   = $EndTime.ToUniversalTime().ToString($fmt)
+$time  = "TimeCreated[@SystemTime&gt;='$start' and @SystemTime&lt;='$end']"
+
+# Events that carry the user's SID can be filtered server-side by SID
+$selects = @(
+    "<Select Path=`"Security`">*[System[(EventID=4624 or EventID=4634 or EventID=4647 or EventID=4800 or EventID=4801) and $time]] and *[EventData[Data[@Name='TargetUserSid']='$Sid']]</Select>"
+)
+# Failed logons and RDP connect/disconnect only carry the name, so filter those by name below
+if ($shortName) {
+    $selects += "<Select Path=`"Security`">*[System[(EventID=4625 or EventID=4778 or EventID=4779) and $time]]</Select>"
+}
+
+$filterXml = @"
+<QueryList>
+  <Query Id="0" Path="Security">
+    $($selects -join "`n    ")
+  </Query>
+</QueryList>
+"@
+
+# ---------- Lookup tables ----------
+$eventNames = @{
+    4624 = 'Logon'
+    4625 = 'Failed logon'
+    4634 = 'Logoff'
+    4647 = 'User-initiated logoff'
+    4800 = 'Workstation locked'
+    4801 = 'Workstation unlocked'
+    4778 = 'RDP reconnect'
+    4779 = 'RDP disconnect'
+}
+$logonTypes = @{
+    '2'  = 'Interactive (console)'
+    '3'  = 'Network'
+    '4'  = 'Batch'
+    '5'  = 'Service'
+    '7'  = 'Unlock'
+    '8'  = 'NetworkCleartext'
+    '9'  = 'NewCredentials (RunAs)'
+    '10' = 'RemoteInteractive (RDP)'
+    '11' = 'CachedInteractive'
+}
+$failReasons = @{
+    '0xc0000064' = 'User does not exist'
+    '0xc000006a' = 'Wrong password'
+    '0xc0000234' = 'Account locked out'
+    '0xc0000072' = 'Account disabled'
+    '0xc000006f' = 'Outside allowed logon hours'
+    '0xc0000070' = 'Workstation restriction'
+    '0xc0000071' = 'Password expired'
+    '0xc0000193' = 'Account expired'
+    '0xc0000224' = 'Must change password'
+}
+
+# ---------- Query ----------
+try {
+    $events = Get-WinEvent -ComputerName $ComputerName -FilterXml $filterXml -ErrorAction Stop
+}
+catch {
+    if ($_.Exception.Message -match 'No events were found') {
+        Write-Warning 'No matching events found in that time range.'
+        return
+    }
+    if ($_.Exception -is [System.UnauthorizedAccessException] -or $_.Exception.Message -match 'unauthorized|access is denied') {
+        throw 'Access denied reading the Security log. Run PowerShell as Administrator.'
+    }
+    throw
+}
+
+# ---------- Parse ----------
+$results = foreach ($e in $events) {
+    $xml = [xml]$e.ToXml()
+    $d = @{}
+    foreach ($n in $xml.Event.EventData.Data) { $d[$n.Name] = $n.'#text' }
+
+    $acct = if ($d.TargetUserName) { $d.TargetUserName } else { $d.AccountName }
+
+    # Name-filtered events: keep only this user (case-insensitive)
+    if ($e.Id -in 4625, 4778, 4779 -and $acct -ne $shortName) { continue }
+
+    $lt = $d.LogonType
+    if ($InteractiveOnly -and $e.Id -in 4624, 4625, 4634 -and $lt -notin '2', '7', '10', '11') { continue }
+
+    $domain = if ($d.TargetDomainName) { $d.TargetDomainName } else { $d.AccountDomain }
+    $src    = @($d.IpAddress, $d.ClientAddress) | Where-Object { $_ -and $_ -ne '-' } | Select-Object -First 1
+    $wks    = @($d.WorkstationName, $d.ClientName) | Where-Object { $_ -and $_ -ne '-' } | Select-Object -First 1
+
+    $detail = $null
+    if ($e.Id -eq 4625) {
+        $code = "$($d.SubStatus)".ToLower()
+        if ($code -eq '0x0' -or -not $code) { $code = "$($d.Status)".ToLower() }
+        $detail = if ($failReasons[$code]) { $failReasons[$code] } else { $code }
+    }
+
     [pscustomobject]@{
-        ComputerName      = $_.PSComputerName
-        Status            = $_.Status
-        InstalledBefore   = $_.InstalledBefore
-        ProvisionedBefore = $_.ProvisionedBefore
-        RemainingAfter    = $_.RemainingAfter
-        Actions           = $_.Actions
-        Errors            = $_.Errors
-    }
-})
-
-# Machines that couldn't be reached over WinRM
-foreach ($e in $connErrors) {
-    $name = $e.TargetObject
-    if (-not $name -and $e.OriginInfo) { $name = $e.OriginInfo.PSComputerName }
-    $results += [pscustomobject]@{
-        ComputerName = $name; Status = 'Unreachable'; InstalledBefore = ''; ProvisionedBefore = ''
-        RemainingAfter = ''; Actions = ''; Errors = $e.Exception.Message
+        Time        = $e.TimeCreated
+        EventId     = $e.Id
+        Action      = $eventNames[$e.Id]
+        User        = "$domain\$acct"
+        LogonType   = if ($lt) { $logonTypes[$lt] } else { $null }
+        SourceIP    = $src
+        Workstation = $wks
+        LogonId     = if ($d.TargetLogonId) { $d.TargetLogonId } else { $d.LogonID }
+        Detail      = $detail
+        Computer    = $e.MachineName
     }
 }
 
-$results | Sort-Object ComputerName | Export-Csv -Path $ReportPath -NoTypeInformation
-$results | Sort-Object ComputerName | Format-Table ComputerName, Status, Errors -AutoSize -Wrap
-$results | Group-Object Status | Format-Table Name, Count -AutoSize
-Write-Host "Report saved to $ReportPath" -ForegroundColor Green
+$results = @($results | Sort-Object Time)
+
+if (-not $results) {
+    Write-Warning 'No matching events found after filtering.'
+    return
+}
+
+Write-Host "Found $($results.Count) events." -ForegroundColor Green
+$results | Format-Table Time, Action, LogonType, SourceIP, Workstation, LogonId, Detail -AutoSize
+
+if ($ExportCsv) {
+    $results | Export-Csv -Path $ExportCsv -NoTypeInformation
+    Write-Host "Saved to $ExportCsv" -ForegroundColor Green
+}
