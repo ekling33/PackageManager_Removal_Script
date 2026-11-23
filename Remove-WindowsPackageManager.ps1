@@ -1,15 +1,16 @@
 <#
 .SYNOPSIS
-    Reports the installed DameWare Mini Remote Control (MRC) version on every machine in machines.txt.
+    Reports the installed DameWare Remote Support (DRS) version on every machine in machines.txt.
 
 .DESCRIPTION
     For each machine it checks:
-      - The Uninstall registry keys (64-bit and 32-bit) for a "Mini Remote Control" entry
-      - The file version of the actual service executable (DWRCS.EXE), located via the dwmrcs service
-      - The state of the DameWare Mini Remote Control service (dwmrcs)
+      - The Uninstall registry keys (64-bit and 32-bit) for a "DameWare Remote Support" entry
+        (Mini Remote Control entries are excluded - DRS often installs MRC alongside it)
+      - The file version of the DRS console executable (DNTU.exe), found via the registry
+        InstallLocation or the standard install folders
 
     Machines are queried in parallel over WinRM (Invoke-Command). If WinRM fails for a machine,
-    the script falls back to reading the file version of \\<machine>\admin$\dwrcs\DWRCS.EXE.
+    the script falls back to reading the file version over the C$ admin share.
 
     Win32_Product is deliberately NOT used: querying it triggers an MSI consistency check on every
     machine and is very slow.
@@ -28,10 +29,10 @@
     Optional. Credentials to use for WinRM. If omitted, your current (admin) session is used.
 
 .EXAMPLE
-    .\Get-DamewareVersion.ps1
+    .\Get-DamewareRemoteSupportVersion.ps1
 
 .EXAMPLE
-    .\Get-DamewareVersion.ps1 -ComputerList D:\lists\machines.txt -Credential (Get-Credential)
+    .\Get-DamewareRemoteSupportVersion.ps1 -ComputerList D:\lists\machines.txt -Credential (Get-Credential)
 #>
 [CmdletBinding()]
 param(
@@ -44,7 +45,19 @@ param(
 # Folder the script lives in (falls back to the current folder if the code was pasted into a console)
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 if (-not $ComputerList) { $ComputerList = Join-Path $scriptDir 'machines.txt' }
-if (-not $OutputCsv)    { $OutputCsv    = Join-Path $scriptDir ("Dameware_Versions_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)) }
+if (-not $OutputCsv)    { $OutputCsv    = Join-Path $scriptDir ("DamewareRemoteSupport_Versions_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date)) }
+
+# Install folders checked when the registry doesn't give one (relative to the system drive)
+$knownFolders = @(
+    'Program Files\SolarWinds\DameWare Remote Support',
+    'Program Files (x86)\SolarWinds\DameWare Remote Support',
+    'Program Files\DameWare Remote Support',
+    'Program Files (x86)\DameWare Remote Support',
+    'Program Files\SolarWinds\DameWare Remote Support x64',
+    'Program Files\DameWare Development\DameWare NT Utilities',
+    'Program Files (x86)\DameWare Development\DameWare NT Utilities'
+)
+$exeName = 'DNTU.exe'
 
 # --- Load the machine list -----------------------------------------------------------------------
 if (-not (Test-Path -LiteralPath $ComputerList)) {
@@ -62,15 +75,17 @@ if (-not $computers) {
     return
 }
 
-Write-Host "Checking DameWare Mini Remote Control on $($computers.Count) machine(s)..." -ForegroundColor Cyan
+Write-Host "Checking DameWare Remote Support on $($computers.Count) machine(s)..." -ForegroundColor Cyan
 
 # --- Code that runs ON each remote machine -------------------------------------------------------
 $scanBlock = {
+    param($knownFolders, $exeName)
+
     $result = [ordered]@{
         DisplayName     = $null
         RegistryVersion = $null
         FileVersion     = $null
-        ServiceState    = 'Not found'
+        InstallLocation = $null
         ExePath         = $null
     }
 
@@ -80,26 +95,26 @@ $scanBlock = {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     $entries = Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -like '*Mini Remote Control*' }
+        Where-Object { $_.DisplayName -like '*DameWare Remote Support*' -and $_.DisplayName -notlike '*Mini Remote Control*' }
 
     if ($entries) {
         $result.DisplayName     = ($entries | ForEach-Object { $_.DisplayName }    | Select-Object -Unique) -join '; '
         $result.RegistryVersion = ($entries | ForEach-Object { $_.DisplayVersion } | Select-Object -Unique) -join '; '
+        $result.InstallLocation = ($entries | Where-Object { $_.InstallLocation } | ForEach-Object { $_.InstallLocation } | Select-Object -Unique) -join '; '
     }
 
-    # 2) The service and its executable
-    $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='dwmrcs'" -ErrorAction SilentlyContinue
-    $exe = $null
-    if ($svc) {
-        $result.ServiceState = "$($svc.State) ($($svc.StartMode))"
-        if ($svc.PathName -match '^\s*"?(?<path>[^"]+?\.exe)') { $exe = $Matches['path'] }
+    # 2) Find the console executable
+    $candidates = @()
+    foreach ($e in $entries) {
+        if ($e.InstallLocation) { $candidates += (Join-Path $e.InstallLocation $exeName) }
     }
-    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
-        $default = Join-Path $env:SystemRoot 'dwrcs\DWRCS.EXE'
-        if (Test-Path -LiteralPath $default) { $exe = $default }
+    foreach ($f in $knownFolders) {
+        $candidates += (Join-Path $env:SystemDrive (Join-Path $f $exeName))
     }
 
-    if ($exe -and (Test-Path -LiteralPath $exe)) {
+    $exe = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+    if ($exe) {
         $vi = (Get-Item -LiteralPath $exe).VersionInfo
         $result.ExePath     = $exe
         $result.FileVersion = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
@@ -112,6 +127,7 @@ $scanBlock = {
 $icmParams = @{
     ComputerName  = $computers
     ScriptBlock   = $scanBlock
+    ArgumentList  = @(, $knownFolders) + $exeName
     ThrottleLimit = $ThrottleLimit
     ErrorAction   = 'SilentlyContinue'
     ErrorVariable = 'remoteErrors'
@@ -139,36 +155,40 @@ foreach ($r in $remoteResults) {
         Version         = if ($r.FileVersion) { $r.FileVersion } else { $r.RegistryVersion }
         RegistryVersion = $r.RegistryVersion
         FileVersion     = $r.FileVersion
-        ServiceState    = $r.ServiceState
         DisplayName     = $r.DisplayName
+        InstallLocation = $r.InstallLocation
         ExePath         = $r.ExePath
         Method          = 'WinRM'
         Error           = $null
     })
 }
 
-# --- Fallback for machines WinRM couldn't reach: read the EXE over the admin$ share --------------
+# --- Fallback for machines WinRM couldn't reach: read the EXE over the C$ share -----------------
 $answered = @($remoteResults | ForEach-Object { $_.PSComputerName.ToUpper() })
 $failed   = $computers | Where-Object { $answered -notcontains $_.ToUpper() }
 
 foreach ($c in $failed) {
     Write-Host "  WinRM failed for $c - trying admin share..." -ForegroundColor Yellow
-    $unc = "\\$c\admin$\dwrcs\DWRCS.EXE"
     $row = [pscustomobject]@{
         ComputerName    = $c
         Status          = 'Unreachable'
         Version         = $null
         RegistryVersion = $null
         FileVersion     = $null
-        ServiceState    = 'Unknown'
         DisplayName     = $null
+        InstallLocation = $null
         ExePath         = $null
         Method          = 'AdminShare'
         Error           = $errorByComputer[$c.ToUpper()]
     }
     try {
-        if (Test-Path -LiteralPath "\\$c\admin$" -ErrorAction Stop) {
-            if (Test-Path -LiteralPath $unc) {
+        if (Test-Path -LiteralPath "\\$c\C$" -ErrorAction Stop) {
+            $unc = $knownFolders |
+                ForEach-Object { "\\$c\C$\$_\$exeName" } |
+                Where-Object { Test-Path -LiteralPath $_ } |
+                Select-Object -First 1
+
+            if ($unc) {
                 $vi = (Get-Item -LiteralPath $unc -ErrorAction Stop).VersionInfo
                 $row.FileVersion = '{0}.{1}.{2}.{3}' -f $vi.FileMajorPart, $vi.FileMinorPart, $vi.FileBuildPart, $vi.FilePrivatePart
                 $row.Version     = $row.FileVersion
@@ -176,7 +196,7 @@ foreach ($c in $failed) {
                 $row.Status      = 'Installed'
             }
             else {
-                $row.Status = 'Not installed (default path)'
+                $row.Status = 'Not installed (default paths)'
             }
             $row.Error = "WinRM failed: $($row.Error)"
         }
@@ -207,7 +227,7 @@ $report = $report | Sort-Object ComputerName
 
 # --- Output -------------------------------------------------------------------------------------
 $report |
-    Select-Object ComputerName, Status, Version, OnNewestVersion, ServiceState, Method |
+    Select-Object ComputerName, Status, Version, OnNewestVersion, Method |
     Format-Table -AutoSize
 
 Write-Host "Summary by version" -ForegroundColor Cyan
@@ -227,7 +247,7 @@ if ($latest) {
 
 $report |
     Select-Object ComputerName, Status, Version, OnNewestVersion, RegistryVersion, FileVersion,
-                  ServiceState, DisplayName, ExePath, Method, Error |
+                  DisplayName, InstallLocation, ExePath, Method, Error |
     Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
 Write-Host "`nFull results saved to: $OutputCsv" -ForegroundColor Cyan
